@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# install -- make pbcopy and pbpaste work in bash and zsh, then prove it.
+#
+#   ./install                install system-wide into /usr/local/bin (asks for sudo)
+#   ./install --user         install into ~/.local/bin, without sudo
+#   ./install --prefix DIR   install into DIR, without sudo
+#   ./install --no-apt       do not install the clipboard backends
+#
+# Safe to run again. Nothing but the two commands is changed, except a marked
+# line in ~/.zshrc or ~/.bashrc when an existing alias (prezto, oh-my-zsh, ...)
+# would otherwise shadow them. ./uninstall reverts both.
+# Clipboard contents are never printed; the self-check restores what it borrows.
+
+set -uo pipefail
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+prefix=""
+mode=system
+use_apt=1
+
+while (( $# )); do
+  case $1 in
+    --user) mode=user ;;
+    --prefix) mode=prefix; prefix=${2:?--prefix needs a directory}; shift ;;
+    --no-apt) use_apt=0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'install: unknown option: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  G=$'\033[0;32m' R=$'\033[0;31m' Y=$'\033[0;33m' B=$'\033[1m' N=$'\033[0m'
+else
+  G='' R='' Y='' B='' N=''
+fi
+failures=0
+ok()   { printf '%s✔%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*"; }
+bad()  { printf '%s✘%s %s\n' "$R" "$N" "$*"; failures=$((failures + 1)); }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+printf '%s📋 pbcopy / pbpaste%s\n\n' "$B" "$N"
+
+if [[ $(uname -s) == Darwin ]]; then
+  ok "macOS already ships pbcopy and pbpaste; nothing to do"
+  exit 0
+fi
+
+# --- sudo, only when it is going to be needed ----------------------------------
+as_root() {
+  if (( EUID == 0 )); then
+    "$@"
+  elif have sudo; then
+    sudo "$@"
+  else
+    return 1
+  fi
+}
+can_sudo() {
+  (( EUID == 0 )) && return 0
+  have sudo || return 1
+  sudo -n true 2>/dev/null && return 0
+  [[ -t 0 ]] || [[ -r /dev/tty ]]
+}
+
+# --- 1. clipboard backends ------------------------------------------------------
+if (( use_apt )) && have apt-get && have dpkg-query; then
+  missing=()
+  for pkg in wl-clipboard xclip; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' ||
+      missing+=("$pkg")
+  done
+  if (( ${#missing[@]} == 0 )); then
+    ok "clipboard backends present (wl-clipboard, xclip)"
+  elif can_sudo && as_root apt-get install -y --no-install-recommends "${missing[@]}" \
+      </dev/tty >/dev/null 2>&1; then
+    ok "installed ${missing[*]}"
+  else
+    warn "could not install ${missing[*]} (no sudo?): copying still works over SSH via OSC52"
+  fi
+elif (( use_apt )); then
+  warn "no apt here: install wl-clipboard (Wayland) or xclip (X11) yourself"
+fi
+
+# --- 2. the two commands --------------------------------------------------------
+use_sudo=0
+case $mode in
+  system)
+    prefix=/usr/local/bin
+    if [[ -w $prefix ]]; then
+      use_sudo=0
+    elif can_sudo; then
+      use_sudo=1
+    else
+      prefix=$HOME/.local/bin
+      warn "no sudo: installing into $prefix instead"
+    fi
+    ;;
+  user) prefix=$HOME/.local/bin ;;
+esac
+
+put() {
+  if (( use_sudo )); then
+    as_root install -d -m 755 "$prefix" </dev/tty &&
+      as_root install -m 755 "$here/bin/pbcopy" "$here/bin/pbpaste" "$prefix/" </dev/tty
+  else
+    install -d "$prefix" && install -m 755 "$here/bin/pbcopy" "$here/bin/pbpaste" "$prefix/"
+  fi
+}
+if put; then
+  ok "installed pbcopy and pbpaste into $prefix"
+else
+  bad "could not write into $prefix"
+  exit 1
+fi
+
+# --- 3. make both shells resolve them to these files ----------------------------
+begin='# >>> pbcopy-pbpaste >>>'
+end='# <<< pbcopy-pbpaste <<<'
+
+add_block() {  # FILE LINE...: append the marked block once
+  local file=$1; shift
+  grep -qxF "$begin" "$file" 2>/dev/null && return 0
+  {
+    printf '\n%s\n' "$begin"
+    printf '%s\n' "$@"
+    printf '%s\n' "$end"
+  } >>"$file"
+}
+
+# What an interactive shell (with the user's rc files) thinks each name is.
+probe() {  # SHELL -> lines "name kind path"
+  case $1 in
+    zsh) timeout 20 env -u TMUX -u TMUX_PANE TERM=dumb zsh -ic \
+           'for c in pbcopy pbpaste; do print -r -- "$c ${$(whence -w $c)##*: } $(whence -p $c)"; done' \
+           </dev/null 2>/dev/null | grep -E '^pb(copy|paste) ' ;;
+    bash) timeout 20 env -u TMUX -u TMUX_PANE TERM=dumb bash -ic \
+           'for c in pbcopy pbpaste; do echo "$c $(type -t $c) $(type -P $c)"; done' \
+           </dev/null 2>/dev/null | grep -E '^pb(copy|paste) ' ;;
+  esac
+}
+
+check_shell() {  # SHELL RCFILE
+  local shell=$1 rc=$2 out name kind path fixed=0
+  have "$shell" || return 0
+  out=$(probe "$shell")
+  if grep -qE '^pb(copy|paste) alias' <<<"$out"; then
+    add_block "$rc" "unalias pbcopy pbpaste 2>/dev/null  # added by pbcopy-pbpaste; ./uninstall removes it"
+    fixed=1
+    out=$(probe "$shell")
+  fi
+  if [[ $mode == user || $prefix == "$HOME/.local/bin" ]] &&
+     ! grep -qE "^pbcopy [a-z]+ $prefix/pbcopy\$" <<<"$out"; then
+    # ~/.local/bin is not on this shell's PATH (zsh does not read ~/.profile).
+    add_block "$rc" "export PATH=\"$prefix:\$PATH\"  # added by pbcopy-pbpaste; ./uninstall removes it"
+    fixed=1
+    out=$(probe "$shell")
+  fi
+  local good=1
+  for name in pbcopy pbpaste; do
+    read -r _ kind path < <(grep -E "^$name " <<<"$out")
+    if [[ ${kind:-} != command && ${kind:-} != file ]] || [[ -z ${path:-} ]]; then
+      bad "$shell: $name is '${kind:-missing}' instead of the installed command"
+      good=0
+    elif [[ $path != "$prefix/$name" ]] && ! cmp -s "$path" "$here/bin/$name"; then
+      warn "$shell: $name resolves to $path (an earlier copy on PATH)"
+    fi
+  done
+  if (( good )); then
+    if (( fixed )); then
+      ok "$shell: pbcopy/pbpaste resolve to the installed commands (removed a shadowing alias in $rc)"
+    else
+      ok "$shell: pbcopy/pbpaste resolve to the installed commands"
+    fi
+  fi
+}
+check_shell bash "$HOME/.bashrc"
+check_shell zsh "${ZDOTDIR:-$HOME}/.zshrc"
+
+# --- 4. does it actually work here? ---------------------------------------------
+pbcopy=$prefix/pbcopy
+pbpaste=$prefix/pbpaste
+backend=$("$pbpaste" --backend 2>/dev/null) || backend=none
+copy_backend=$("$pbcopy" --backend 2>/dev/null) || copy_backend=none
+
+text_ok() {  # the clipboard is empty or offers text, so borrowing it loses nothing
+  local types
+  case $backend in
+    wayland) types=$(timeout 2 wl-paste --list-types 2>/dev/null) || return 0 ;;
+    x11) types=$(timeout 2 xclip -selection clipboard -out -target TARGETS 2>/dev/null) || return 0 ;;
+  esac
+  [[ -z $types ]] || grep -qiE '^(text/plain|UTF8_STRING|STRING|TEXT)' <<<"$types"
+}
+
+if [[ $backend == wayland || $backend == x11 ]]; then
+  if ! text_ok; then
+    ok "$backend clipboard is live (round-trip skipped: it holds non-text data, left untouched)"
+  else
+    saved=$(mktemp) && chmod 600 "$saved"
+    "$pbpaste" >"$saved" 2>/dev/null || : >"$saved"
+    sample=$'pbcopy-pbpaste self-check ✓\nline two'"-$$"
+    printf '%s' "$sample" | "$pbcopy"
+    sleep 0.3
+    got=$("$pbpaste" 2>/dev/null; printf x)
+    got=${got%x}
+    if [[ -s $saved ]]; then
+      "$pbcopy" <"$saved"
+    elif [[ $backend == wayland ]]; then
+      wl-copy --clear 2>/dev/null || :
+    else
+      printf '' | "$pbcopy"
+    fi
+    rm -f -- "$saved"
+    if [[ $got == "$sample" ]]; then
+      ok "copy/paste round trip through the $backend clipboard (your clipboard was restored)"
+    else
+      bad "round trip through the $backend clipboard returned different bytes"
+    fi
+  fi
+elif [[ -n ${SSH_TTY:-} ]]; then
+  ok "over SSH: pbcopy copies through your terminal (OSC52); pbpaste needs the desktop session"
+else
+  ok "no graphical session here: both work in your desktop session"
+fi
+
+echo
+if (( failures )); then
+  printf '%s%d check(s) failed.%s\n' "$R" "$failures" "$N"
+  exit 1
+fi
+printf '%s✔ All set:%s try  %secho hi | pbcopy; pbpaste%s\n' "$G" "$N" "$B" "$N"

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# uninstall -- remove what ./install added, and nothing else.
+#
+#   ./uninstall              remove from /usr/local/bin and ~/.local/bin
+#   ./uninstall --prefix DIR remove from DIR as well
+#
+# A command is removed only when it is byte-identical to this repository's
+# copy, so another pbcopy/pbpaste is never deleted. The marked lines ./install
+# added to ~/.zshrc or ~/.bashrc are removed; the rest of those files is kept.
+
+set -uo pipefail
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+dirs=(/usr/local/bin "$HOME/.local/bin")
+while (( $# )); do
+  case $1 in
+    --prefix) dirs+=("${2:?--prefix needs a directory}"); shift ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'uninstall: unknown option: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+removed=0
+for dir in "${dirs[@]}"; do
+  for name in pbcopy pbpaste; do
+    file=$dir/$name
+    [[ -f $file ]] && cmp -s "$file" "$here/bin/$name" || continue
+    if [[ -w $dir ]]; then
+      rm -f -- "$file"
+    else
+      sudo rm -f -- "$file" </dev/tty
+    fi && { echo "removed $file"; removed=$((removed + 1)); }
+  done
+done
+
+begin='# >>> pbcopy-pbpaste >>>'
+end='# <<< pbcopy-pbpaste <<<'
+for rc in "$HOME/.bashrc" "${ZDOTDIR:-$HOME}/.zshrc"; do
+  [[ -f $rc ]] && grep -qxF "$begin" "$rc" || continue
+  tmp=$(mktemp "$rc.XXXXXX") || continue
+  # Drop the block and the one blank line ./install put in front of it.
+  awk -v b="$begin" -v e="$end" '
+    { line[NR] = $0 }
+    END {
+      n = 0
+      for (i = 1; i <= NR; i++) {
+        if (line[i] == b) {
+          if (n > 0 && kept[n] == "") n--
+          while (i <= NR && line[i] != e) i++
+          continue
+        }
+        kept[++n] = line[i]
+      }
+      for (i = 1; i <= n; i++) print kept[i]
+    }
+  ' "$rc" >"$tmp" && cat "$tmp" >"$rc"
+  rm -f -- "$tmp"
+  echo "removed the pbcopy-pbpaste lines from $rc"
+done
+
+(( removed )) || echo "nothing to remove in ${dirs[*]}"
