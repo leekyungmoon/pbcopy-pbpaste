@@ -1,9 +1,9 @@
 
-# pbcopy-pbpaste
+# 🪶 pbcopy-pbpaste
 
-📋 macOS's `pbcopy` and `pbpaste`, for Linux.
+**Featherweight `pbcopy` & `pbpaste` for Linux.**
 
-🪶 **Lightweight:** two plain bash scripts, 8 KB in total. No daemon, no config file, no runtime beyond `wl-clipboard` or `xclip`, and nothing else on your machine is touched.
+Two plain bash scripts — **8 KB**, no daemon, no config, nothing else touched.
 
 
 ## Installation
